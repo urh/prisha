@@ -2,6 +2,8 @@
 
 A comprehensive wealth planning and retirement simulation application built for Israeli households. The app helps track assets, manage budgets, simulate equity vesting, and plan for early retirement with accurate Israeli tax calculations.
 
+![Screenshot](assets/screenshot.png)
+
 ## Features
 
 ### Asset Management

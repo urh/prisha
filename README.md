@@ -101,4 +101,4 @@ The UI is in Hebrew with right-to-left (RTL) layout, designed specifically for I
 
 ## License
 
-Private project.
+MIT

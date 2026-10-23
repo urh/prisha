@@ -16,9 +16,20 @@ export interface EquityCompany {
   contracts: EquityContract[];
   exitConfig: {
     exitYear: number;
+    // Month of the exit (1..12, defaults to 1 = January when absent).
+    exitMonth?: number;
+    /** Informational only; the engine uses sharePriceAtExit. */
     valuationAtExit: number;
     sharePriceAtExit: number;
     retentionBonusUsd?: number;
+    // Optional partial cash-out before the full exit.
+    // Added to investments (net ILS) on the first of secondaryMonth of
+    // secondaryYear (secondaryMonth is 1..12, defaults to 1 = January).
+    secondaryIls?: number;
+    secondaryYear?: number;
+    secondaryMonth?: number;
+    // Shares sold in that secondary — no longer there at the exit.
+    secondaryShares?: number;
   };
   totalShares?: number; // For net equity calculation
   color: 'indigo' | 'purple' | 'emerald' | 'rose' | 'blue' | 'amber';
@@ -45,12 +56,33 @@ export interface AppExportData {
   salaryData: SalaryData;
   equityCompanies: EquityCompany[];
   propertyPlan: PropertyPlan;
-  simulationParams: {
-    returnRate: number;
-    inflationRate: number;
-    transitionToHalfWorkYear: number;
-    stopWorkYear: number;
-  };
+  simulationParams: SimulationParamsState;
+}
+
+/**
+ * Forecast assumptions. Everything past the original four is optional so old
+ * exports and older localStorage snapshots still load — callers fall back to
+ * `defaultSimulationParams`.
+ */
+export interface SimulationParamsState {
+  returnRate: number;
+  inflationRate: number;
+  transitionToHalfWorkYear: number;
+  stopWorkYear: number;
+  /** Annual return volatility, %. 0 reproduces the old smooth forecast. */
+  annualVolatility?: number;
+  /** Target probability the money lasts to end of life, 0..1. */
+  successTarget?: number;
+  withdrawalMode?: 'fixed' | 'amortized' | 'dynamic';
+  /** Amortized-mode guardrails, in today's ILS. 0 = unset. */
+  spendFloor?: number;
+  spendCap?: number;
+  /** De-risk the portfolio with age instead of holding 100% equities. */
+  glidepathEnabled?: boolean;
+  /** Share of modelled exit proceeds the upside plan assumes, 0..1. */
+  equityConfidence?: number;
+  /** Whether the plan includes a half-time phase before stopping entirely. */
+  halfTimeEnabled?: boolean;
 }
 
 // Current export format version
@@ -114,6 +146,12 @@ export function validateExpense(expense: unknown, index: number, type: string): 
   if (typeof e.amount !== 'number' || isNaN(e.amount) || e.amount < 0) {
     errors.push(`${type} expense ${index}: Missing or invalid 'amount' (must be non-negative number)`);
   }
+  if (e.everyNYears !== undefined && (typeof e.everyNYears !== 'number' || isNaN(e.everyNYears) || e.everyNYears < 1)) {
+    errors.push(`${type} expense ${index}: Invalid 'everyNYears' (must be a positive number)`);
+  }
+  if (e.oneTime !== undefined && typeof e.oneTime !== 'boolean') {
+    errors.push(`${type} expense ${index}: Invalid 'oneTime' (must be boolean)`);
+  }
   
   return errors;
 }
@@ -129,11 +167,18 @@ export function validateSalaryData(salary: unknown): string[] {
   }
   
   const s = salary as Record<string, unknown>;
-  const fields = ['person1Gross', 'person1Net', 'person2Gross', 'person2Net'];
+  const requiredFields = ['person1Gross', 'person1Net', 'person2Gross', 'person2Net'];
+  const optionalFields = ['monthlyStateIncome', 'annualBonus'];
   
-  fields.forEach(field => {
+  requiredFields.forEach(field => {
     if (typeof s[field] !== 'number' || isNaN(s[field] as number) || (s[field] as number) < 0) {
       errors.push(`Salary data: Invalid '${field}' (must be non-negative number)`);
+    }
+  });
+
+  optionalFields.forEach(field => {
+    if (s[field] !== undefined && (typeof s[field] !== 'number' || isNaN(s[field] as number) || (s[field] as number) < 0)) {
+      errors.push(`Salary data: Invalid '${field}' (must be non-negative number if provided)`);
     }
   });
   
@@ -218,11 +263,31 @@ export function validateEquityCompany(company: unknown, index: number): string[]
     if (typeof ec.exitYear !== 'number' || isNaN(ec.exitYear)) {
       errors.push(`Equity company ${index}: Invalid 'exitConfig.exitYear'`);
     }
-    if (typeof ec.valuationAtExit !== 'number' || isNaN(ec.valuationAtExit)) {
+    if (
+      ec.exitMonth !== undefined &&
+      (typeof ec.exitMonth !== 'number' || isNaN(ec.exitMonth) ||
+       (ec.exitMonth as number) < 1 || (ec.exitMonth as number) > 12)
+    ) {
+      errors.push(`Equity company ${index}: Invalid 'exitConfig.exitMonth' (must be 1-12)`);
+    }
+    if (ec.valuationAtExit !== undefined && (typeof ec.valuationAtExit !== 'number' || isNaN(ec.valuationAtExit))) {
       errors.push(`Equity company ${index}: Invalid 'exitConfig.valuationAtExit'`);
     }
     if (typeof ec.sharePriceAtExit !== 'number' || isNaN(ec.sharePriceAtExit)) {
       errors.push(`Equity company ${index}: Invalid 'exitConfig.sharePriceAtExit'`);
+    }
+    if (ec.secondaryIls !== undefined && (typeof ec.secondaryIls !== 'number' || isNaN(ec.secondaryIls) || (ec.secondaryIls as number) < 0)) {
+      errors.push(`Equity company ${index}: Invalid 'exitConfig.secondaryIls' (must be non-negative number)`);
+    }
+    if (ec.secondaryYear !== undefined && (typeof ec.secondaryYear !== 'number' || isNaN(ec.secondaryYear))) {
+      errors.push(`Equity company ${index}: Invalid 'exitConfig.secondaryYear'`);
+    }
+    if (
+      ec.secondaryMonth !== undefined &&
+      (typeof ec.secondaryMonth !== 'number' || isNaN(ec.secondaryMonth) ||
+       (ec.secondaryMonth as number) < 1 || (ec.secondaryMonth as number) > 12)
+    ) {
+      errors.push(`Equity company ${index}: Invalid 'exitConfig.secondaryMonth' (must be 1-12)`);
     }
   }
   
@@ -484,5 +549,6 @@ export function createDefaultContract(): EquityContract {
     startDate: `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-01`,
     periodYears: 4,
     cliffMonths: 12,
+    cliffType: 'standard',
   };
 }

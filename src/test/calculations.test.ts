@@ -7,17 +7,20 @@ import {
   calculateTotalAssets,
   calculatePensionValue,
   calculateInvestmentValue,
+  calculateLiquidAfterTax,
+  calculateLiquidGain,
   calculateMonthlyReturn,
   calculateMonthlyInflation,
   calculateEarlyPensionWithdrawal,
   calculateGrossForDesiredNet,
   calculatePensionAnnuity,
   calculatePensionAnnuityTax,
-  calculateInvestmentWithdrawalTax,
+  calculatePensionAnnuityTaxIsraeli,
+  pensionAnnuityEffectiveRate,
+  PENSION_ELIGIBLE_CEILING_MONTHLY,
+  PENSION_EXEMPTION_RATE,
   calculateMarginalTax,
   calculateEffectiveTaxRate,
-  findOptimalWithdrawal,
-  runSimulation,
   SURTAX_THRESHOLD,
   PENSION_CONTRIBUTION_RATE,
   EARLY_PENSION_PENALTY_TAX,
@@ -27,7 +30,8 @@ import {
   EMPLOYMENT_TAX_BRACKETS,
   CAPITAL_GAINS_TAX_BRACKETS,
 } from '../utils/calculations';
-import type { EquityContract, Expense, SalaryData, Asset, SimulationDataPoint } from '../types';
+import { withdrawNetFromInvestments } from '../utils/projection';
+import type { EquityContract, Expense, SalaryData, Asset } from '../types';
 
 describe('calculateNetEquity - Israeli Capital Gains Tax', () => {
   it('returns 0 for zero or negative profit', () => {
@@ -254,6 +258,35 @@ describe('calculateBudgetSummary', () => {
       { id: 1, name: 'Test', amount: '5000' as unknown as number }
     ];
     const result = calculateBudgetSummary(stringExpenses, [], salaryData);
+    expect(result.totalExpenseToday).toBe(5000);
+  });
+
+  it('includes state income and annual bonus (/12) in net income', () => {
+    const extended: SalaryData = {
+      ...salaryData,
+      monthlyStateIncome: 150,
+      annualBonus: 36000,
+    };
+    const result = calculateBudgetSummary(monthlyExpenses, yearlyExpenses, extended);
+    // 35200 + 26300 + 150 + 36000/12 = 64650
+    expect(result.totalIncomeNet).toBe(64650);
+  });
+
+  it('amortizes every-N-years expenses (car every 5 years)', () => {
+    const yearly: Expense[] = [
+      { id: 1, name: 'Car', amount: 150000, everyNYears: 5 },
+    ];
+    const result = calculateBudgetSummary([], yearly, salaryData);
+    // 150000 / 5 / 12 = 2500
+    expect(result.totalExpenseToday).toBe(2500);
+  });
+
+  it('one-time expenses impact current-year average but not recurring', () => {
+    const yearly: Expense[] = [
+      { id: 1, name: 'Trip', amount: 60000, oneTime: true },
+    ];
+    const result = calculateBudgetSummary([], yearly, salaryData);
+    // 60000 / 12 = 5000 (for dashboard display)
     expect(result.totalExpenseToday).toBe(5000);
   });
 });
@@ -542,6 +575,47 @@ describe('calculatePensionAnnuity (age 60+)', () => {
   });
 });
 
+describe('Israeli pension annuity tax (קצבה מזכה)', () => {
+  it('is fully exempt for a couple with a modest annuity', () => {
+    // 67% of the ~₪9,430 ceiling each, plus credits, covers it entirely.
+    expect(calculatePensionAnnuityTaxIsraeli(20_000, { recipients: 2 })).toBe(0);
+  });
+
+  it('is progressive — a bigger annuity pays a higher effective rate', () => {
+    const small = pensionAnnuityEffectiveRate(30_000, { recipients: 2 });
+    const large = pensionAnnuityEffectiveRate(80_000, { recipients: 2 });
+    expect(large).toBeGreaterThan(small);
+  });
+
+  it('costs a couple much less than one person drawing the same pot', () => {
+    // Exemption, credits and brackets all apply per recipient.
+    expect(pensionAnnuityEffectiveRate(58_000, { recipients: 2 }))
+      .toBeLessThan(pensionAnnuityEffectiveRate(58_000, { recipients: 1 }));
+  });
+
+  it('caps the exemption at the ceiling, not at a share of the pension', () => {
+    // Doubling a well-above-ceiling annuity more than doubles the tax.
+    const at40 = calculatePensionAnnuityTaxIsraeli(40_000, { recipients: 2 });
+    const at80 = calculatePensionAnnuityTaxIsraeli(80_000, { recipients: 2 });
+    expect(at80).toBeGreaterThan(at40 * 2);
+  });
+
+  it('never returns a negative tax once credits exceed the liability', () => {
+    expect(calculatePensionAnnuityTaxIsraeli(11_000, { recipients: 2 })).toBeGreaterThanOrEqual(0);
+    expect(calculatePensionAnnuityTaxIsraeli(0)).toBe(0);
+    expect(calculatePensionAnnuityTaxIsraeli(-500)).toBe(0);
+  });
+
+  it('stays well under the top marginal rate even for a large annuity', () => {
+    expect(pensionAnnuityEffectiveRate(120_000, { recipients: 2 })).toBeLessThan(0.4);
+  });
+
+  it('exposes the 2025 parameters it was built from', () => {
+    expect(PENSION_ELIGIBLE_CEILING_MONTHLY).toBe(9430);
+    expect(PENSION_EXEMPTION_RATE).toBe(0.67);
+  });
+});
+
 describe('calculatePensionAnnuityTax (age 60+)', () => {
   it('applies 15% tax on pension annuity', () => {
     expect(FIXED_PENSION_TAX).toBe(0.15);
@@ -558,33 +632,6 @@ describe('calculatePensionAnnuityTax (age 60+)', () => {
   it('returns 0 for zero or negative annuity', () => {
     expect(calculatePensionAnnuityTax(0)).toBe(0);
     expect(calculatePensionAnnuityTax(-1000)).toBe(0);
-  });
-});
-
-describe('calculateInvestmentWithdrawalTax', () => {
-  it('applies 25% capital gains tax', () => {
-    const amount = 100000;
-    const tax = calculateInvestmentWithdrawalTax(amount, 500000); // Below surtax threshold
-    
-    expect(tax).toBe(25000); // 25%
-  });
-
-  it('adds 3% surtax when annual income exceeds threshold', () => {
-    const amount = 100000;
-    // Annual income above SURTAX_THRESHOLD (721,500)
-    const tax = calculateInvestmentWithdrawalTax(amount, 800000);
-    
-    // 25% + 3% = 28%
-    expect(tax).toBe(28000);
-  });
-
-  it('verifies surtax threshold is 721,560', () => {
-    expect(SURTAX_THRESHOLD).toBe(721560);
-  });
-
-  it('returns 0 for zero or negative amounts', () => {
-    expect(calculateInvestmentWithdrawalTax(0, 500000)).toBe(0);
-    expect(calculateInvestmentWithdrawalTax(-1000, 500000)).toBe(0);
   });
 });
 
@@ -617,124 +664,18 @@ describe('Tax rule integration - withdrawal priority', () => {
   });
 });
 
-describe('Simulation edge cases and bugs', () => {
-  const baseParams = {
-    investmentInitialValue: 1500000, // 1.5M investments
-    pensionInitialValue: 1500000, // 1.5M pension = 3M total
-    returnRate: 6,
-    inflationRate: 2.5,
-    transitionToHalfWorkYear: 5,
-    stopWorkYear: 15,
-    budgetSummary: {
-      totalExpenseToday: 35000,
-      totalIncomeNet: 61500,
-      totalPensionInflow: 22800,
-    },
-    monthlyExpenses: [
-      { id: 1, name: 'Rent', amount: 12000 },
-      { id: 2, name: 'Other', amount: 23000 },
-    ],
-    yearlyExpenses: [] as Expense[],
-    propertyConfig: { price: 7000000, year: 2050, monthlySavings: 8000 }, // Far future, no property purchase
-    equityCompanies: [], // No equity companies for base test
-    initialAge: 34,
-    endOfLifeAge: 90,
-  };
-
-  it('BUG FIX: should return non-zero withdrawal with 3M assets', () => {
-    const result = findOptimalWithdrawal(baseParams);
-    
-    // With 3M assets at age 34, even with moderate expenses,
-    // there should be SOME sustainable withdrawal rate
-    expect(result.val).toBeGreaterThan(0);
-  });
-
-  it('BUG FIX: should handle 3M assets with 7M property purchase gracefully', () => {
-    const paramsWithProperty = {
-      ...baseParams,
-      propertyConfig: { price: 7000000, year: 2030, monthlySavings: 8000 }, // Buy property in 4 years
-    };
-    
-    const result = findOptimalWithdrawal(paramsWithProperty);
-    
-    // With only 3M assets and a 7M property purchase, this should either:
-    // - Return a positive withdrawal if somehow sustainable
-    // - Or return 0 if the numbers don't work (which is valid)
-    // But it should NOT crash and should return valid data
-    expect(result.data.length).toBeGreaterThan(0);
-    
-    // Check that data is valid even if val is 0
-    const lastPoint = result.data[result.data.length - 1];
-    expect(lastPoint).toBeDefined();
-    expect(typeof lastPoint.totalLegacy).toBe('number');
-  });
-
-  it('BUG FIX: with very low assets, should still find minimum sustainable withdrawal', () => {
-    const lowAssetParams = {
-      ...baseParams,
-      investmentInitialValue: 500000, // Only 500k investments
-      pensionInitialValue: 500000, // Only 500k pension = 1M total
-    };
-    
-    const result = findOptimalWithdrawal(lowAssetParams);
-    
-    // Even with 1M, there should be some withdrawal possible
-    // (might be very low, but not 0)
-    expect(result.val).toBeGreaterThanOrEqual(0);
-    // If result is 0, the data should still be valid
-    expect(result.data.length).toBeGreaterThan(0);
-  });
-
-  it('BUG FIX: pension should NOT convert to annuity at age 60 if still working', () => {
-    // Set retirement at age 65 (31 years from age 34)
-    const params = {
-      ...baseParams,
-      stopWorkYear: 31, // Retire at 65
-    };
-    
-    // Run simulation with some withdrawal rate
-    const data = runSimulation(30000, params);
-    
-    // Find data point at age 60 (26 years from start)
-    const age60Data = data.find((d: SimulationDataPoint) => Math.abs(parseFloat(d.fullAge) - 60) < 0.5);
-    
-    // At age 60, person is still working (until age 65)
-    // So pension should NOT be converted, and should still have balance
-    expect(age60Data).toBeDefined();
-    // Should be working (either full or half salary)
-    expect(['שכר מלא', 'חצי משרה']).toContain(age60Data!.incomeSource);
-    expect(age60Data!.pension).toBeGreaterThan(0); // Pension should not be 0
-    expect(age60Data!.withdrawalFromPension).toBe(0); // Not withdrawing from pension
-  });
-
-  it('pension should convert to annuity at retirement (age 65), not age 60', () => {
-    const params = {
-      ...baseParams,
-      stopWorkYear: 31, // Retire at 65
-    };
-    
-    const data = runSimulation(30000, params);
-    
-    // Find data point right after age 65
-    const age65Data = data.find((d: SimulationDataPoint) => parseFloat(d.fullAge) >= 65 && parseFloat(d.fullAge) < 66);
-    
-    // At retirement, pension should be converted to annuity
-    expect(age65Data).toBeDefined();
-    expect(age65Data!.pension).toBe(0); // Pension converted
-    expect(age65Data!.pensionAnnuity).toBeGreaterThan(0); // Now receiving annuity
-    expect(age65Data!.incomeSource).not.toContain('שכר'); // No longer salary
-  });
-
-  it('withdrawal breakdown should show 0 during working phase', () => {
-    const data = runSimulation(30000, baseParams);
-    
-    // During first 5 years (full work), no withdrawals should happen
-    const workingData = data.filter((d: SimulationDataPoint) => parseFloat(d.fullAge) < 39);
-    
-    workingData.forEach((d: SimulationDataPoint) => {
-      expect(d.withdrawalFromInvestments).toBe(0);
-      expect(d.withdrawalFromPension).toBe(0);
-    });
+describe('Liquid after-tax (28% CGT on Meitav gains)', () => {
+  it('subtracts 28% of liquid gainIls; non-liquid or gainless assets untaxed', () => {
+    const assets = [
+      { id: 4, name: 'stocks A', value: 2012762, type: 'liquid' as const, gainIls: 910813 },
+      { id: 5, name: 'stocks B', value: 675503, type: 'liquid' as const, gainIls: 281263 },
+      { id: 2, name: 'keren', value: 408995, type: 'liquid' as const },
+      { id: 1, name: 'pension', value: 2547723, type: 'pension' as const, gainIls: 999999 },
+    ];
+    const liquidVal = 2012762 + 675503 + 408995;
+    const liquidGain = 910813 + 281263;
+    expect(calculateLiquidGain(assets)).toBe(liquidGain);
+    expect(calculateLiquidAfterTax(assets)).toBe(Math.round(liquidVal - 0.28 * liquidGain));
   });
 });
 
@@ -759,10 +700,13 @@ describe('Full pension lifecycle scenario', () => {
     // Before age 60, need to withdraw 50,000 net monthly = 600,000 annual
     // Have only 30,000 in investments (monthly)
     
-    // Withdraw all investments (30k with 25% tax = ~7,500 tax)
-    const invTax = calculateInvestmentWithdrawalTax(30000, 50000 * 12);
-    expect(invTax).toBe(7500);
-    
+    // Withdraw all investments. With the whole balance being gain, the
+    // effective rate is the full 25% → 7,500 of tax on a 30,000 sale.
+    const ledger = { inv: 30000, basis: 0, pen: 0 };
+    const invSale = withdrawNetFromInvestments(ledger, 30000, 50000 * 12);
+    expect(invSale.tax).toBeCloseTo(7500, 6);
+    expect(ledger.inv).toBeCloseTo(0, 6);
+
     // Remaining 20k/month = 240k/year must come from pension (marginal tax)
     const annualNetNeeded = 20000 * 12;
     const grossFromPensionAnnual = calculateGrossForDesiredNet(annualNetNeeded);
@@ -785,5 +729,49 @@ describe('Full pension lifecycle scenario', () => {
     expect(result.effectiveRate).toBeGreaterThan(0.35);
     expect(result.effectiveRate).toBeLessThan(0.50);
     expect(result.netAmount).toBeCloseTo(annualNet, 0);
+  });
+});
+
+describe('Vesting cliff semantics', () => {
+  it('delayed-linear cliff: no vesting before cliff, then quarterly over remaining period', () => {
+    const contract: EquityContract = {
+      name: 'delayed',
+      shares: 12000,
+      strike: 1.0,
+      startDate: '2025-01-01',
+      periodYears: 4,
+      cliffMonths: 12,
+      cliffType: 'delayed-linear',
+    };
+
+    // Before cliff
+    expect(getVestingAtDate([contract], new Date('2025-06-01')).totalVested).toBe(0);
+    // Right at cliff
+    expect(getVestingAtDate([contract], new Date('2026-01-01')).totalVested).toBe(0);
+    // After first quarter post-cliff (3 months) — 12000 / (3 years * 4 quarters) = 1000
+    expect(getVestingAtDate([contract], new Date('2026-04-01')).totalVested).toBeCloseTo(1000, 0);
+    // Halfway through remaining linear period (18 months post-cliff) — half of 12000
+    expect(getVestingAtDate([contract], new Date('2027-07-01')).totalVested).toBeCloseTo(6000, -2);
+    // After period end
+    expect(getVestingAtDate([contract], new Date('2029-01-01')).totalVested).toBe(12000);
+  });
+
+  it('standard cliff still gives 25% lump at cliff then linear', () => {
+    const contract: EquityContract = {
+      name: 'standard',
+      shares: 12000,
+      strike: 1.0,
+      startDate: '2025-01-01',
+      periodYears: 4,
+      cliffMonths: 12,
+      cliffType: 'standard',
+    };
+
+    // At cliff: 1/4 should vest
+    expect(getVestingAtDate([contract], new Date('2026-01-01')).totalVested).toBeCloseTo(3000, 0);
+    // Halfway through total period: half
+    expect(getVestingAtDate([contract], new Date('2027-01-01')).totalVested).toBeCloseTo(6000, 0);
+    // After period
+    expect(getVestingAtDate([contract], new Date('2029-01-01')).totalVested).toBe(12000);
   });
 });

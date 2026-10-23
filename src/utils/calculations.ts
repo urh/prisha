@@ -11,6 +11,8 @@ import type {
 // Constants
 export const SURTAX_THRESHOLD = 721560;
 export const PENSION_CONTRIBUTION_RATE = 0.20;
+export const STUDY_FUND_RATE = 0.10;       // keren hishtalmut ~10% of capped salary
+export const STUDY_FUND_CEILING = 15712;   // monthly salary ceiling for study-fund contributions
 export const PROPERTY_APPRECIATION_RATE = 0.02;
 export const FIXED_COEFFICIENT = 210;
 export const FIXED_PENSION_TAX = 0.15;
@@ -88,8 +90,12 @@ export function calculateCapitalGainsEffectiveRate(amount: number): number {
 
 /**
  * Calculate vesting at a specific date for equity contracts
- * 
- * Handles cliff periods and linear vesting
+ *
+ * Supports two cliff semantics:
+ *  - "standard": classic cliff (e.g. 25% lump at 12-month cliff on a 4-year
+ *    grant, then linear vesting along the same slope).
+ *  - "delayed-linear": nothing catches up at the cliff — after the cliff,
+ *    the remaining shares vest linearly over (periodYears*12 - cliffMonths).
  */
 export function getVestingAtDate(contracts: EquityContract[], targetDate: Date): VestingResult {
   let totalVested = 0;
@@ -101,16 +107,24 @@ export function getVestingAtDate(contracts: EquityContract[], targetDate: Date):
     const monthsDiff = (targetDate.getFullYear() - start.getFullYear()) * 12 + 
                        (targetDate.getMonth() - start.getMonth());
     const totalMonths = contract.periodYears * 12;
+    const cliffMonths = contract.cliffMonths || 0;
     
     let vested = 0;
     
-    // Check if cliff period has passed
-    if (monthsDiff >= (contract.cliffMonths || 0)) {
-      // Linear vesting calculation
-      vested = Math.min(
-        contract.shares, 
-        Math.max(0, (monthsDiff / totalMonths) * contract.shares)
-      );
+    if (monthsDiff >= cliffMonths) {
+      if (contract.cliffType === 'delayed-linear') {
+        const remainingMonths = Math.max(1, totalMonths - cliffMonths);
+        const postCliffMonths = Math.min(remainingMonths, monthsDiff - cliffMonths);
+        vested = Math.min(
+          contract.shares,
+          Math.max(0, (postCliffMonths / remainingMonths) * contract.shares)
+        );
+      } else {
+        vested = Math.min(
+          contract.shares,
+          Math.max(0, (monthsDiff / totalMonths) * contract.shares)
+        );
+      }
     }
     
     totalVested += vested;
@@ -124,6 +138,23 @@ export function getVestingAtDate(contracts: EquityContract[], targetDate: Date):
   });
   
   return { totalVested, totalCost, details };
+}
+
+/**
+ * Effective monthly amount for a yearly expense, amortized and
+ * respecting one-time/every-N-years flags.
+ *
+ * - oneTime expenses contribute 0 (they are tracked historically in the
+ *   "today" balance by default, so we count the full impact in the current year
+ *   (amount / 12). Pass includeOneTime=false when building forward-looking
+ *   recurring totals for the simulation.
+ * - Recurring expenses with everyNYears > 1 contribute amount / N / 12.
+ */
+export function yearlyExpenseMonthlyAmount(e: Expense, includeOneTime: boolean = true): number {
+  const raw = parseFloat(String(e.amount)) || 0;
+  if (e.oneTime) return includeOneTime ? raw / 12 : 0;
+  const n = Math.max(1, Number(e.everyNYears) || 1);
+  return raw / n / 12;
 }
 
 /**
@@ -144,16 +175,23 @@ export function calculateBudgetSummary(
   );
   
   const totalYearlyToMonthly = safeYearly.reduce(
-    (sum, e) => sum + (parseFloat(String(e.amount)) || 0), 
+    (sum, e) => sum + yearlyExpenseMonthlyAmount(e), 
     0
-  ) / 12;
+  );
+
+  const salaryNet = (parseFloat(String(salaryData.person1Net)) || 0) +
+                    (parseFloat(String(salaryData.person2Net)) || 0);
+  const stateIncome = parseFloat(String(salaryData.monthlyStateIncome ?? 0)) || 0;
+  const annualBonus = parseFloat(String(salaryData.annualBonus ?? 0)) || 0;
   
   return { 
     totalExpenseToday: Math.round(totalMonthlyFixed + totalYearlyToMonthly),
-    totalIncomeNet: (parseFloat(String(salaryData.person1Net)) || 0) + 
-                    (parseFloat(String(salaryData.person2Net)) || 0),
+    totalIncomeNet: salaryNet + stateIncome + annualBonus / 12,
     totalPensionInflow: ((parseFloat(String(salaryData.person1Gross)) || 0) + 
-                         (parseFloat(String(salaryData.person2Gross)) || 0)) * PENSION_CONTRIBUTION_RATE
+                         (parseFloat(String(salaryData.person2Gross)) || 0)) * PENSION_CONTRIBUTION_RATE,
+    totalStudyFundInflow:
+      Math.min(parseFloat(String(salaryData.person1Gross)) || 0, STUDY_FUND_CEILING) * STUDY_FUND_RATE +
+      Math.min(parseFloat(String(salaryData.person2Gross)) || 0, STUDY_FUND_CEILING) * STUDY_FUND_RATE
   };
 }
 
@@ -173,6 +211,42 @@ export function calculatePensionValue(assets: Asset[]): number {
   return assets
     .filter(a => a.type === "pension")
     .reduce((sum, a) => sum + (parseFloat(String(a.value)) || 0), 0);
+}
+
+
+/**
+ * Capital-gains tax assumed on the unrealized profit of the liquid
+ * securities portfolios: 25% Israeli CGT + 3% high-earner surtax = 28%.
+ */
+export const LIQUID_GAIN_TAX_RATE = 0.28;
+
+/** Total value of liquid-type assets (cash + securities portfolios). */
+export function calculateLiquidValue(assets: Asset[]): number {
+  return assets
+    .filter(a => a.type === "liquid")
+    .reduce((sum, a) => sum + (parseFloat(String(a.value)) || 0), 0);
+}
+
+/**
+ * Unrealized gain across the liquid securities portfolios. Only assets
+ * carrying a Meitav-sourced gainIls contribute; keren-hishtalmut / cash
+ * (no gainIls) count as zero gain.
+ */
+export function calculateLiquidGain(assets: Asset[]): number {
+  return assets
+    .filter(a => a.type === "liquid")
+    .reduce((sum, a) => sum + (parseFloat(String(a.gainIls)) || 0), 0);
+}
+
+/**
+ * Liquid wealth after capital-gains tax: liquid value minus the tax on the
+ * embedded unrealized gain - the realistic spendable liquid today.
+ */
+export function calculateLiquidAfterTax(
+  assets: Asset[],
+  rate: number = LIQUID_GAIN_TAX_RATE,
+): number {
+  return Math.round(calculateLiquidValue(assets) - rate * calculateLiquidGain(assets));
 }
 
 /**
@@ -198,62 +272,6 @@ export function calculateMonthlyInflation(annualRate: number): number {
   return Math.pow(1 + annualRate / 100, 1/12);
 }
 
-/**
- * Simulation parameters
- */
-export interface EquityCompanyConfig {
-  id: string;
-  name: string;
-  contracts: EquityContract[];
-  exitYear: number;
-  sharePriceAtExit: number;
-}
-
-export interface SimulationParams {
-  investmentInitialValue: number;
-  pensionInitialValue: number;
-  returnRate: number;
-  inflationRate: number;
-  transitionToHalfWorkYear: number;
-  stopWorkYear: number;
-  budgetSummary: BudgetSummary;
-  monthlyExpenses: Expense[];
-  yearlyExpenses: Expense[];
-  propertyConfig: { price: number; year: number; monthlySavings?: number };
-  equityCompanies: EquityCompanyConfig[];
-  initialAge: number;
-  endOfLifeAge: number;
-}
-
-/**
- * Run simulation to find optimal withdrawal rate
- * Uses binary search to find maximum sustainable withdrawal
- */
-export function findOptimalWithdrawal(params: SimulationParams): { val: number; data: ReturnType<typeof runSimulation> } {
-  let low = 5000;
-  let high = 500000;
-  let bestVal = 0;
-  
-  for (let i = 0; i < 30; i++) {
-    const mid = (low + high) / 2;
-    const data = runSimulation(mid, params);
-    
-    const bankrupt = data.some(p => 
-      p.liquidWealth <= 0 && 
-      p.index < (params.endOfLifeAge - params.initialAge) * 12 - 12
-    );
-    const finalSolvent = data[data.length - 1].liquidWealth <= 2000;
-    
-    if (!bankrupt && !finalSolvent) {
-      bestVal = mid;
-      low = mid;
-    } else {
-      high = mid;
-    }
-  }
-  
-  return { val: Math.round(bestVal), data: runSimulation(bestVal, params) };
-}
 
 /**
  * Calculate marginal tax using Israeli tax brackets
@@ -377,279 +395,70 @@ export function calculatePensionAnnuity(pensionBalance: number): number {
 }
 
 /**
+ * Israeli pension-annuity taxation (קצבה מזכה), 2025 figures.
+ *
+ * A flat 15% was a placeholder. The real treatment: a slice of the monthly
+ * annuity is exempt — `PENSION_EXEMPTION_RATE` of the eligible-pension ceiling,
+ * per recipient — and whatever is left is ordinary income taxed at the
+ * employment brackets, less personal credits. Both the ceiling and the credit
+ * are indexed to the CPI, so working in today's shekels keeps them valid.
+ *
+ * Two recipients matter a lot here: the exemption, the credits and the whole
+ * bracket ladder all apply per person, so a couple splitting one pot pays far
+ * less than one person drawing it alone.
+ */
+export const PENSION_ELIGIBLE_CEILING_MONTHLY = 9430;
+export const PENSION_EXEMPTION_RATE = 0.67;
+/** ~2.25 credit points, the rounded couple-average, per recipient per month. */
+export const PENSION_TAX_CREDIT_MONTHLY = 545;
+
+export interface PensionTaxOptions {
+  recipients?: number;
+  ceilingMonthly?: number;
+  exemptionRate?: number;
+  creditMonthly?: number;
+}
+
+/**
+ * Monthly tax on a gross annuity, in the same (real) units as the input.
+ */
+export function calculatePensionAnnuityTaxIsraeli(
+  monthlyGross: number,
+  opts: PensionTaxOptions = {},
+): number {
+  if (monthlyGross <= 0) return 0;
+  const recipients = Math.max(1, opts.recipients ?? 2);
+  const ceiling = opts.ceilingMonthly ?? PENSION_ELIGIBLE_CEILING_MONTHLY;
+  const exemptionRate = opts.exemptionRate ?? PENSION_EXEMPTION_RATE;
+  const credit = opts.creditMonthly ?? PENSION_TAX_CREDIT_MONTHLY;
+
+  const perPerson = monthlyGross / recipients;
+  // The exemption is a share of the *ceiling*, not of your pension, so a large
+  // annuity does not get a proportionally larger exemption.
+  const exempt = exemptionRate * Math.min(perPerson, ceiling);
+  const taxablePerPerson = Math.max(0, perPerson - exempt);
+
+  const annualTax = calculateMarginalTax(taxablePerPerson * 12, EMPLOYMENT_TAX_BRACKETS);
+  const monthlyAfterCredit = Math.max(0, annualTax / 12 - credit);
+  return monthlyAfterCredit * recipients;
+}
+
+/** Effective rate on the annuity, for reporting and for discounting. */
+export function pensionAnnuityEffectiveRate(
+  monthlyGross: number,
+  opts: PensionTaxOptions = {},
+): number {
+  if (monthlyGross <= 0) return 0;
+  return calculatePensionAnnuityTaxIsraeli(monthlyGross, opts) / monthlyGross;
+}
+
+/**
  * Calculate tax on pension annuity (after age 60)
- * Standard 15% tax on pension income in Israel
+ * Legacy flat 15% — superseded by calculatePensionAnnuityTaxIsraeli, kept
+ * because the historical figures in the dashboard were produced with it.
  */
 export function calculatePensionAnnuityTax(monthlyAnnuity: number): number {
   if (monthlyAnnuity <= 0) return 0;
   return monthlyAnnuity * FIXED_PENSION_TAX;
 }
 
-/**
- * Calculate capital gains tax on investment withdrawals
- * 25% capital gains + 3% surtax if above threshold
- */
-export function calculateInvestmentWithdrawalTax(amount: number, annualIncome: number): number {
-  if (amount <= 0) return 0;
-  
-  // Base capital gains tax: 25%
-  let tax = amount * 0.25;
-  
-  // Add surtax if total annual income exceeds threshold
-  if (annualIncome > SURTAX_THRESHOLD) {
-    tax += amount * 0.03;
-  }
-  
-  return tax;
-}
-
-/**
- * Run monthly simulation
- */
-export function runSimulation(targetWithdrawal: number, params: SimulationParams) {
-  const {
-    investmentInitialValue,
-    pensionInitialValue,
-    returnRate,
-    inflationRate,
-    transitionToHalfWorkYear,
-    stopWorkYear,
-    budgetSummary,
-    monthlyExpenses,
-    yearlyExpenses,
-    propertyConfig,
-    equityCompanies,
-    initialAge,
-    endOfLifeAge,
-  } = params;
-
-  let curInv = investmentInitialValue;
-  let curPen = pensionInitialValue;
-  let propValue = 0;
-  let monthlyAnnuity = 0; // Pension annuity after age 60
-  
-  const monthlyReturn = calculateMonthlyReturn(returnRate);
-  const monthlyInflation = calculateMonthlyInflation(inflationRate);
-  const data: any[] = [];
-
-  // Monthly savings after buying property (e.g., rent that we stop paying)
-  const monthlySavingsAfterProperty = propertyConfig.monthlySavings || 0;
-  
-  // Total monthly expenses (all expenses)
-  const totalMonthlyExpenses = (monthlyExpenses || [])
-    .reduce((sum, e) => sum + (parseFloat(String(e.amount)) || 0), 0) + 
-    ((yearlyExpenses || []).reduce((sum, e) => sum + (parseFloat(String(e.amount)) || 0), 0) / 12);
-
-  const totalMonths = (endOfLifeAge - initialAge) * 12;
-  
-  // Track vested shares already cashed out per company (to avoid double counting)
-  const exitedCompanies = new Set<string>();
-  const previousVestedShares: Record<string, number> = {};
-  
-  // Initialize previous vested to 0 for all companies
-  equityCompanies.forEach(company => {
-    previousVestedShares[company.id] = 0;
-  });
-
-  for (let m = 0; m <= totalMonths; m++) {
-    const date = new Date(2026, m, 1);
-    const curYear = date.getFullYear();
-    const yearsPassed = m / 12;
-    const curAge = initialAge + yearsPassed;
-    const eventLabels: string[] = [];
-    let income = 0;
-    let source = "שכר";
-    let taxPaid = 0;
-    let withdrawalFromInvestments = 0;
-    let withdrawalFromPension = 0;
-    let currentPensionAnnuity = 0;
-
-    // Handle equity - dynamic for all companies
-    for (const company of equityCompanies) {
-      if (company.contracts.length === 0 || company.sharePriceAtExit <= 0) continue;
-      
-      const vest = getVestingAtDate(company.contracts, date);
-      const currentVested = vest.totalVested;
-      
-      // At exit year (January): cash out all vested shares
-      if (curYear === company.exitYear && date.getMonth() === 0 && !exitedCompanies.has(company.id)) {
-        const grossValue = (currentVested * company.sharePriceAtExit * 3.5) - (vest.totalCost * 3.5);
-        curInv += calculateNetEquity(grossValue);
-        exitedCompanies.add(company.id);
-        previousVestedShares[company.id] = currentVested;
-        eventLabels.push(`${company.name} Exit`);
-      }
-      // After exit: cash out newly vested shares each month
-      else if (exitedCompanies.has(company.id)) {
-        const newlyVested = currentVested - previousVestedShares[company.id];
-        if (newlyVested > 0) {
-          // Calculate cost basis for newly vested shares
-          const totalShares = company.contracts.reduce((sum, c) => sum + c.shares, 0);
-          const avgStrike = totalShares > 0 ? vest.totalCost / currentVested : 0;
-          const grossValue = (newlyVested * company.sharePriceAtExit * 3.5) - (newlyVested * avgStrike * 3.5);
-          curInv += calculateNetEquity(grossValue);
-          previousVestedShares[company.id] = currentVested;
-        }
-      }
-    }
-
-    // Handle property
-    const ownsProp = curYear >= propertyConfig.year;
-    if (ownsProp) {
-      if (curYear === propertyConfig.year && date.getMonth() === 0) {
-        curInv -= propertyConfig.price;
-        propValue = propertyConfig.price;
-        eventLabels.push(`רכישת דירה`);
-      } else {
-        propValue *= Math.pow(1 + PROPERTY_APPRECIATION_RATE, 1/12);
-      }
-    }
-
-    // Calculate monthly expenses (adjusted for inflation)
-    // After buying property, we save the monthlySavings amount (e.g., rent)
-    const expenseBeforeSavings = totalMonthlyExpenses;
-    const monthlyExpenseBase = (ownsProp ? expenseBeforeSavings - monthlySavingsAfterProperty : expenseBeforeSavings) * Math.pow(monthlyInflation, m);
-    let monthlyOut = monthlyExpenseBase;
-    let monthlySavings = 0;
-
-    if (yearsPassed < stopWorkYear) {
-      // Working phase
-      income = (yearsPassed < transitionToHalfWorkYear) ? budgetSummary.totalIncomeNet : monthlyExpenseBase;
-      source = (yearsPassed < transitionToHalfWorkYear) ? "שכר מלא" : "חצי משרה";
-      curPen = (curPen * (1 + monthlyReturn)) + 
-               (yearsPassed < transitionToHalfWorkYear ? 
-                 budgetSummary.totalPensionInflow/12 : 
-                 budgetSummary.totalPensionInflow/24);
-      curInv = (curInv * (1 + monthlyReturn)) + income - monthlyOut;
-      monthlySavings = income - monthlyOut;
-    } else {
-      // Retirement phase - target withdrawal is constant (adjusted for inflation)
-      const desiredWithdrawal = targetWithdrawal * Math.pow(monthlyInflation, m);
-      monthlyOut = desiredWithdrawal;
-      
-      if (curAge < 60) {
-        // Before age 60: Early withdrawal with marginal tax brackets
-        // Non-employment income: 31% up to 269K, 35% up to 560K, 47% up to 721K, 52% above
-        // First try to withdraw from investments (25% capital gains tax)
-        // If not enough, withdraw from pension (marginal income tax)
-        
-        // Apply growth first
-        curInv *= (1 + monthlyReturn);
-        curPen *= (1 + monthlyReturn);
-        
-        // Annualize for tax bracket calculation
-        const annualWithdrawal = desiredWithdrawal * 12;
-        
-        if (curInv >= desiredWithdrawal) {
-          // Can cover entirely from investments
-          withdrawalFromInvestments = desiredWithdrawal;
-          const invTax = calculateInvestmentWithdrawalTax(desiredWithdrawal, annualWithdrawal);
-          taxPaid = invTax;
-          // Withdraw gross amount (tax is embedded)
-          curInv -= desiredWithdrawal;
-          source = "משיכה מהשקעות";
-        } else {
-          // Need to withdraw from pension too
-          withdrawalFromInvestments = Math.max(0, curInv);
-          const invTax = calculateInvestmentWithdrawalTax(withdrawalFromInvestments, annualWithdrawal);
-          curInv = 0;
-          
-          // Remaining needed from pension (with marginal tax brackets)
-          const remainingNeeded = desiredWithdrawal - withdrawalFromInvestments;
-          // Calculate annual gross needed and convert to monthly
-          const annualGrossFromPension = calculateGrossForDesiredNet(remainingNeeded * 12, 0);
-          const monthlyGrossFromPension = annualGrossFromPension / 12;
-          withdrawalFromPension = monthlyGrossFromPension;
-          
-          const pensionTaxResult = calculateEarlyPensionWithdrawal(monthlyGrossFromPension * 12, 0);
-          const pensionTaxMonthly = pensionTaxResult.taxPaid / 12;
-          
-          curPen -= monthlyGrossFromPension;
-          taxPaid = invTax + pensionTaxMonthly;
-          
-          // Show effective rate in source description
-          const effectiveRate = Math.round(pensionTaxResult.effectiveRate * 100);
-          source = `משיכה מהון + פנסיה (מס ${effectiveRate}%)`;
-        }
-        
-        income = 0;
-      } else {
-        // Age 60+: Convert pension to annuity on first month
-        if (curPen > 0 && monthlyAnnuity === 0) {
-          // Convert pension balance to monthly annuity
-          const grossAnnuity = calculatePensionAnnuity(curPen);
-          const annuityTax = calculatePensionAnnuityTax(grossAnnuity);
-          monthlyAnnuity = grossAnnuity - annuityTax;
-          curPen = 0;
-          eventLabels.push("המרה לקצבת פנסיה");
-        }
-        
-        // Annuity grows with inflation each month
-        if (m > 0) {
-          monthlyAnnuity *= monthlyInflation;
-        }
-        currentPensionAnnuity = monthlyAnnuity;
-        
-        // Apply investment growth
-        curInv *= (1 + monthlyReturn);
-        
-        // Calculate how much more we need beyond the annuity
-        if (desiredWithdrawal <= monthlyAnnuity) {
-          // Annuity covers everything
-          income = monthlyAnnuity;
-          withdrawalFromPension = monthlyAnnuity;
-          withdrawalFromInvestments = 0;
-          taxPaid = monthlyAnnuity * (FIXED_PENSION_TAX / (1 - FIXED_PENSION_TAX)); // Already deducted
-          source = "קצבת פנסיה";
-          // Excess annuity goes back to investments
-          curInv += (monthlyAnnuity - desiredWithdrawal);
-        } else {
-          // Need to supplement from investments
-          const gapNeeded = desiredWithdrawal - monthlyAnnuity;
-          withdrawalFromPension = monthlyAnnuity;
-          withdrawalFromInvestments = gapNeeded;
-          
-          // Tax on annuity (already deducted) + capital gains on investment withdrawal
-          const annuityGross = monthlyAnnuity / (1 - FIXED_PENSION_TAX);
-          const annuityTaxPaid = annuityGross * FIXED_PENSION_TAX;
-          const invTax = calculateInvestmentWithdrawalTax(gapNeeded, (monthlyAnnuity + gapNeeded) * 12);
-          taxPaid = annuityTaxPaid + invTax;
-          
-          curInv -= gapNeeded;
-          income = monthlyAnnuity;
-          source = "קצבה + השקעות";
-        }
-      }
-      
-      monthlySavings = income - monthlyOut;
-    }
-
-    const liquidWealth = Math.max(0, curInv + curPen);
-
-    if (m % 3 === 0 || m < 36) {
-      data.push({ 
-        index: m, 
-        label: `${date.getMonth()+1}/${date.getFullYear()}`, 
-        fullAge: curAge.toFixed(1), 
-        totalLegacy: Math.round(liquidWealth + propValue), 
-        liquidWealth: Math.round(liquidWealth), 
-        investments: Math.round(Math.max(0, curInv)), 
-        pension: Math.round(Math.max(0, curPen)), 
-        property: Math.round(propValue), 
-        monthlyOutflow: Math.round(monthlyOut), 
-        monthlySavings: Math.round(monthlySavings),
-        currentIncome: Math.round(income), 
-        incomeSource: source, 
-        earlyTaxPenalty: Math.round(taxPaid),
-        event: eventLabels.length > 0 ? eventLabels.join(" + ") : null,
-        // New fields for withdrawal breakdown
-        withdrawalFromInvestments: Math.round(withdrawalFromInvestments),
-        withdrawalFromPension: Math.round(withdrawalFromPension),
-        pensionAnnuity: Math.round(currentPensionAnnuity),
-        taxPaid: Math.round(taxPaid)
-      });
-    }
-  }
-  
-  return data;
-}
